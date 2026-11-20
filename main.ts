@@ -15,7 +15,10 @@
 //   * Guardrails: a trophy whose observed logit range is negligible keeps slope 0;
 //     the projected median never falls more than a small dilution dip below the last
 //     rate (earner counts are monotone; only new-player dilution can pull a rate down);
-//     medians are capped (97% ordinary, tighter for the platinum, ~99% absolute).
+//     medians are capped (97% ordinary, tighter for the platinum, ~99% absolute,
+//     and never more than a small margin above the best rate the trophy's tier
+//     has reached anywhere in the history); a trophy never observed at all starts
+//     from the median last rate of its own tier instead of a global percentile.
 //   * Spread: sigma = sqrt( (S * sqrt(horizon_days))^2 + (K * |projected move|)^2 ),
 //     floored and capped — the random-walk term prices clock risk, the move term prices
 //     extrapolation risk, so a bold projection honestly widens its own band.
@@ -36,6 +39,7 @@ const CAP_ORDINARY = 97; // median ceiling for a normal trophy, percent
 const CAP_PLATINUM = 50; // median ceiling for the platinum, percent
 const CAP_PINNED = 99.9; // ceiling for a trophy pinned at ~100% in every read
 const CAP_ABSOLUTE = 99; // ceiling for everything else, percent
+const TIER_CEILING_MARGIN = 5; // pp of headroom a projection gets above its tier's best observed rate
 const SPREAD_S = 0.55; // random-walk spread, logit units per sqrt(day)
 const SPREAD_K = 0.4; // extra spread per unit of projected logit move
 const SIGMA_FLOOR = 0.08;
@@ -166,11 +170,28 @@ function forecast(c: CaseFile): Array<{ id: number; q: number[] }> {
       }
     }
   }
-  // Fallback for a trophy never observed: the cross-trophy 10th percentile of the
-  // observed last rates (rare trophies are the ones that go missing).
-  const observed = lastRate.filter((r): r is number => r !== null).sort((a, b) => a - b);
-  const fallbackRate =
-    observed.length > 0 ? observed[Math.min(observed.length - 1, Math.floor(0.1 * observed.length))] : DEFAULT_RATE_PCT;
+  // Fallback for a trophy never observed: the median last rate of the trophies in
+  // the SAME tier. Tiers are earned at very different rates (a bronze story trophy
+  // and the platinum differ by orders of magnitude), so a tier-matched median is a
+  // far better prior than any single cross-trophy percentile; a tier with no
+  // observed trophy at all falls back to the cross-trophy median, then the default.
+  const observedAll: number[] = [];
+  const observedByTier = new Map<string, number[]>();
+  for (let i = 0; i < n; i++) {
+    const r = lastRate[i];
+    if (r === null) continue;
+    observedAll.push(r);
+    const tier = c.trophies[i].tier ?? '';
+    const bucket = observedByTier.get(tier);
+    if (bucket) bucket.push(r);
+    else observedByTier.set(tier, [r]);
+  }
+  const globalMedian = observedAll.length > 0 ? medianOf(observedAll) : null;
+  const fallbackFor = (tier: string | undefined): number => {
+    const bucket = tier !== undefined ? observedByTier.get(tier) : undefined;
+    if (bucket && bucket.length > 0) return medianOf(bucket);
+    return globalMedian ?? DEFAULT_RATE_PCT;
+  };
 
   // Per-trophy weighted fits on the logit/log-time plane.
   const ownSlope: Array<number | null> = new Array(n).fill(null);
@@ -200,9 +221,22 @@ function forecast(c: CaseFile): Array<{ id: number; q: number[] }> {
   }
   const pooledSlope = medianOf(ownSlope.filter((s): s is number => s !== null && Number.isFinite(s)));
 
+  // Highest rate each tier has actually reached anywhere in the history — the
+  // reference for the per-tier projection ceiling applied in the row loop.
+  const tierMaxRate = new Map<string, number>();
+  for (let j = 0; j < hist.length; j++) {
+    for (let i = 0; i < n; i++) {
+      const r = hist[j].rates[i];
+      if (r === null || r === undefined || !Number.isFinite(r)) continue;
+      const tier = c.trophies[i].tier ?? '';
+      const cur = tierMaxRate.get(tier);
+      if (cur === undefined || r > cur) tierMaxRate.set(tier, r);
+    }
+  }
+
   const rows: Array<{ id: number; q: number[] }> = [];
   for (let i = 0; i < n; i++) {
-    const base = lastRate[i] ?? fallbackRate;
+    const base = lastRate[i] ?? fallbackFor(c.trophies[i].tier);
     const baseLogit = logitOf(base);
 
     // Shrink the trophy's own slope toward the pooled slope; a flat history or a
@@ -225,6 +259,13 @@ function forecast(c: CaseFile): Array<{ id: number; q: number[] }> {
     const pinned = base >= 99.9 && logitRange[i] < FLAT_RANGE;
     const cap = pinned ? CAP_PINNED : c.trophies[i].tier === 'platinum' ? CAP_PLATINUM : Math.min(CAP_ORDINARY, CAP_ABSOLUTE);
     if (medianPct > cap) medianPct = cap;
+    // Earn rates saturate: a projection may outrun the best rate its own tier has
+    // ever reached in the observed history by only a small margin — nothing in the
+    // field has yet shown a tier sustaining more than that.
+    const tierMax = tierMaxRate.get(c.trophies[i].tier ?? '');
+    if (tierMax !== undefined && medianPct > tierMax + TIER_CEILING_MARGIN) {
+      medianPct = tierMax + TIER_CEILING_MARGIN;
+    }
     if (medianPct < 0.01) medianPct = 0.01;
     medianLogit = logitOf(medianPct);
 
